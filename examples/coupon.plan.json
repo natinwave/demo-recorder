@@ -1,0 +1,17 @@
+{
+  "name": "Coupon checkout",
+  "baseUrl": "http://localhost:3000",
+  "window": { "width": 1440, "height": 900 },
+  "steps": [
+    { "do": "goto", "url": "/login", "edit": "cut" },
+    { "do": "fill", "target": "#email", "text": "demo@example.com", "edit": "cut" },
+    { "do": "fill", "target": "#password", "text": "demo-password", "edit": "cut" },
+    { "do": "click", "target": "role=button[name='Sign in']", "edit": "cut" },
+
+    { "do": "goto", "url": "/cart", "moment": "Open the cart" },
+    { "do": "type", "target": "#code", "text": "SAVE10", "moment": "Enter a coupon code" },
+    { "do": "click", "target": "role=button[name='Apply coupon']" },
+    { "do": "expect", "target": "#message", "text": "Coupon applied", "moment": "The discount is applied" },
+    { "do": "highlight", "target": "#total" }
+  ]
+}

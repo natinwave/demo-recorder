@@ -1,0 +1,4 @@
+node_modules/
+demo-videos/
+.DS_Store
+*.log
