@@ -3,6 +3,9 @@
   "baseUrl": "http://localhost:3000",
   "window": { "width": 1440, "height": 900 },
   "steps": [
+    { "do": "title", "eyebrow": "Shopper", "title": "Apply a coupon at checkout",
+      "subtitle": "A signed-in shopper redeems a discount code.",
+      "points": ["Open the cart", "Enter a coupon code", "See the discount applied to the total"] },
     { "do": "goto", "url": "/login", "edit": "cut" },
     { "do": "fill", "target": "#email", "text": "demo@example.com", "edit": "cut" },
     { "do": "fill", "target": "#password", "text": "demo-password", "edit": "cut" },

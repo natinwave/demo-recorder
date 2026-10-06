@@ -35,7 +35,8 @@ Output goes to `demo-videos/<plan name>/`:
 
 Options: `--frame window` (default: crop to the whole Chrome window, tabs and
 address bar included) or `--frame screen` (the entire display), `--out <dir>`,
-`--check` (validate the plan only), `--no-cut`, `--keep-open`.
+`--check` (validate the plan only), `--no-cut`, `--keep-open`, `--signin`
+(see below).
 
 The raw recording is always the full display, so you can switch framing later
 without re-recording:
@@ -51,6 +52,8 @@ to the failure is still produced), `3` Chrome was not visible in the recording.
       "name": "Coupon checkout",
       "baseUrl": "http://localhost:3000",
       "steps": [
+        { "do": "title", "eyebrow": "Shopper", "title": "Apply a coupon at checkout",
+          "points": ["Open the cart", "Enter a coupon code", "See the discount applied"] },
         { "do": "goto", "url": "/cart", "moment": "Open the cart" },
         { "do": "type", "target": "#code", "text": "SAVE10", "moment": "Enter a coupon code" },
         { "do": "click", "target": "role=button[name='Apply coupon']" },
@@ -61,11 +64,14 @@ to the failure is still produced), `3` Chrome was not visible in the recording.
 Plan-level keys (all optional except `steps`): `name`, `baseUrl`, `frame`
 (`window` | `screen`), `window` (`{width, height}`, default 1440x900),
 `captions` (default true: show each moment label on the page), `timeout`
-(seconds per step, default 15), `momentHold` (seconds to linger after a labeled
-step, default 1.5), `pace` (pause after every step, default 0.3), `tail`
-(seconds kept after the last step, default 1), `profile` (name of a persistent
-Chrome profile, to stay signed in between recordings), `storageState`
-(Playwright storage-state file), `browser` (Playwright channel, default `chrome`).
+(seconds per step, default 15), `readingSpeed` (words per minute used to time
+captions, highlights and title cards, default 180; lower it for a slower video),
+`momentHold` (minimum seconds to linger after a labeled step, default 2; longer
+captions get their reading time), `pace` (pause after every step, default 0.3),
+`tail` (seconds kept after the last step, default 1), `profile` (name of a
+persistent Chrome profile, to stay signed in between recordings), `signinUrls`
+(pages `--signin` opens, default `baseUrl`), `storageState` (Playwright
+storage-state file), `browser` (Playwright channel, default `chrome`).
 
 Step keys: `do` plus the fields below; `target` is a Playwright selector
 (`#id`, `text=Save`, `role=button[name='Save']`, ...). Any step may add
@@ -88,9 +94,28 @@ linger afterwards) and `timeout`.
 | `waitForUrl` | `url` | String, glob or regex source |
 | `expect` | `target`, `text` | Fails the recording if the text never appears |
 | `wait` | `seconds` | |
-| `highlight` | `target`, `seconds` | Draws a ring around the element |
+| `highlight` | `target`, `seconds` | Draws a ring around the element; without `seconds`, holds long enough to read its text (2-7 s) |
+| `title` | `title`, `subtitle`, `points`, `eyebrow`, `seconds` | Full-frame title card between sections (see below) |
 | `eval` | `js` | Runs JavaScript in the page |
 | `switchTab` | `url` or `which` | Default: the tab that just opened |
+
+## Title cards and reading time
+
+A `title` step shows a full-frame card: an optional `eyebrow` (small caps, e.g.
+"Part 2 of 4 · Admin"), the `title`, an optional `subtitle` and up to a few
+`points` summarising what comes next. Use one at the start, and one whenever
+the demo changes perspective (customer, admin, partner...), so viewers always
+know whose screen they are looking at.
+
+The card is drawn in the page and captured as a still image; the cutter then
+shows that still for `seconds` (default: reading time at `readingSpeed`, 3-12 s),
+scaled to fill the frame with no tabs or address bar. It costs no recording
+time and gets its own chapter marker. The stills are saved as `title-NN.png`
+next to the video.
+
+Reading time is spent only where it pays off: labeled steps (`moment`) hold for
+their caption, `highlight` holds for the text inside the ring, title cards for
+their text. Unlabeled steps such as filling fields stay quick.
 
 How the cut is decided (`edit` on a step overrides it):
 
@@ -137,6 +162,16 @@ are optional. Labels become chapter markers in the output.
   recording runs.
 - Chrome opens with a fresh profile, so nothing is signed in. Use `"profile"`
   or sign in with steps marked `"edit": "cut"`.
+- To sign in to a profile by hand, run `node record.mjs plan.json --signin`. It
+  opens the plan's profile with the same settings a recording uses, at
+  `signinUrls` (or `baseUrl`); sign in, then close the window. Signing in with an
+  ordinary Chrome window does not work: the recorder's Chrome cannot read
+  cookies that ordinary Chrome saved.
+- Sites behind an HTTP basic-auth prompt: Chrome cancels the prompt under
+  automation. Set `DEMO_HTTP_USER` and `DEMO_HTTP_PASSWORD` (optionally
+  `DEMO_HTTP_ORIGIN` to send them to one site only) in the environment; they are
+  never read from the plan. During `--signin` you can instead type
+  `https://user:password@host/` in the address bar.
 - macOS: the main display is recorded. Set `DEMO_SCREEN=1` for another display.
 - A new browser *window* (not a tab) falls outside the window crop; the recorder
   warns when that happens. Use `--frame screen`.

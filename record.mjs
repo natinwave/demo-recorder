@@ -15,6 +15,7 @@ import { cutFromMoments } from './cut.mjs';
 const USAGE = `Usage:
   node record.mjs <plan.json> [options]
   node record.mjs --selftest            Record a built-in 10 second plan to check the setup
+  node record.mjs <plan.json> --signin  Open the plan's profile to sign in by hand; close the window when done
 
 Options:
   --out <dir>        Output folder (default: ./demo-videos/<plan name>)
@@ -22,11 +23,15 @@ Options:
   --check            Validate the plan and exit without recording
   --no-cut           Record only; skip the automatic cut
   --keep-open        Leave Chrome open after the plan finishes
+  --signin           Open the plan's "profile" (no recording) so you can sign in; waits until the window closes
 
 Environment:
   DEMO_BROWSER_PATH  Path to a Chrome/Chromium binary (default: installed Google Chrome)
   DEMO_SCREEN        Which display to record on macOS (default 0, the main display)
   DEMO_ENCODER       x264 | videotoolbox (default: videotoolbox on macOS, else x264)
+  DEMO_HTTP_USER     HTTP basic-auth username for sites behind a login prompt (keep it out of plan files)
+  DEMO_HTTP_PASSWORD HTTP basic-auth password
+  DEMO_HTTP_ORIGIN   Only send the basic-auth login to this origin, e.g. https://staging.example.com
 
 Exit codes: 0 ok, 1 setup or plan problem, 2 a plan step failed, 3 Chrome was not visible in the recording`;
 
@@ -49,6 +54,7 @@ const ACTIONS = {
   highlight: ['target'],
   eval: ['js'],
   switchTab: [],
+  title: ['title'],
 };
 const EDITS = ['auto', 'keep', 'fast', 'cut'];
 
@@ -57,6 +63,10 @@ export function validatePlan(plan) {
   if (!plan || typeof plan !== 'object') return ['The plan must be a JSON object.'];
   if (!Array.isArray(plan.steps) || !plan.steps.length) problems.push('"steps" must be a non-empty array.');
   if (plan.frame && !['window', 'screen'].includes(plan.frame)) problems.push('"frame" must be "window" or "screen".');
+  if (plan.readingSpeed != null && !(Number(plan.readingSpeed) > 0)) problems.push('"readingSpeed" must be a positive number of words per minute.');
+  if (plan.signinUrls != null && !(Array.isArray(plan.signinUrls) && plan.signinUrls.every((u) => typeof u === 'string'))) {
+    problems.push('"signinUrls" must be an array of URLs.');
+  }
   (plan.steps ?? []).forEach((step, i) => {
     const where = `steps[${i}]`;
     if (!step || typeof step !== 'object') { problems.push(`${where} must be an object.`); return; }
@@ -66,6 +76,9 @@ export function validatePlan(plan) {
     }
     if (step.edit && !EDITS.includes(step.edit)) problems.push(`${where}.edit must be one of: ${EDITS.join(', ')}.`);
     if (step.moment != null && typeof step.moment !== 'string') problems.push(`${where}.moment must be a string.`);
+    if (step.do === 'title' && step.points != null && !(Array.isArray(step.points) && step.points.every((p) => typeof p === 'string'))) {
+      problems.push(`${where}.points must be an array of strings.`);
+    }
     if (step.do === 'goto' && step.url && !/^[a-z]+:/i.test(step.url) && !plan.baseUrl) {
       problems.push(`${where}.url "${step.url}" is relative but the plan has no "baseUrl".`);
     }
@@ -83,6 +96,7 @@ function selftestPlan() {
   return {
     name: 'selftest',
     steps: [
+      { do: 'title', title: 'Self-test', subtitle: 'Checks screen capture, the cursor, captions and cutting.', points: ['Open a test page', 'Click a button twice'] },
       { do: 'goto', url: `data:text/html,${encodeURIComponent(html)}`, moment: 'Open the test page' },
       { do: 'click', target: '#b', moment: 'Click the button' },
       { do: 'wait', seconds: 4 },
@@ -94,8 +108,90 @@ function selftestPlan() {
 
 const slug = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'demo';
 
+/**
+ * Seconds a viewer needs to read `text` at `wpm` words per minute, plus a beat to
+ * register it, kept between `min` and `max`.
+ */
+export function readingSeconds(text, wpm, { base = 1, min = 0, max = Infinity } = {}) {
+  const words = String(text ?? '').split(/\s+/).filter(Boolean).length;
+  return Math.min(max, Math.max(min, base + words / (wpm / 60)));
+}
+
+function browserOptions(plan, planDir) {
+  const want = { width: 1440, height: 900, ...(plan.window ?? {}) };
+  const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+  const launchOptions = {
+    headless: false,
+    chromiumSandbox: !isRoot,
+    ignoreDefaultArgs: ['--enable-automation'],
+    args: [
+      '--window-position=0,0',
+      `--window-size=${want.width},${want.height}`,
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--hide-crash-restore-bubble',
+      '--disable-features=Translate,InfiniteSessionRestore',
+      ...(isRoot ? ['--test-type'] : []),
+    ],
+  };
+  if (process.env.DEMO_BROWSER_PATH) launchOptions.executablePath = process.env.DEMO_BROWSER_PATH;
+  else launchOptions.channel = plan.browser ?? 'chrome';
+  const contextOptions = { viewport: null, ...(plan.baseUrl ? { baseURL: plan.baseUrl } : {}) };
+  if (plan.storageState) contextOptions.storageState = path.resolve(planDir, plan.storageState);
+  // Chrome cancels HTTP basic-auth prompts under automation, so the login has to come from here.
+  // It is read from the environment only, so it never ends up in a plan file or a recording.
+  if (process.env.DEMO_HTTP_USER) {
+    contextOptions.httpCredentials = {
+      username: process.env.DEMO_HTTP_USER,
+      password: process.env.DEMO_HTTP_PASSWORD ?? '',
+      ...(process.env.DEMO_HTTP_ORIGIN ? { origin: process.env.DEMO_HTTP_ORIGIN } : {}),
+    };
+  }
+  const profileDir = plan.profile ? path.join(os.homedir(), '.demo-recorder', 'profiles', slug(plan.profile)) : null;
+  return { want, launchOptions, contextOptions, profileDir };
+}
+
+async function openContext({ launchOptions, contextOptions, profileDir }) {
+  try {
+    if (profileDir) {
+      await fs.mkdir(profileDir, { recursive: true });
+      return { browser: null, context: await chromium.launchPersistentContext(profileDir, { ...launchOptions, ...contextOptions }) };
+    }
+    const browser = await chromium.launch(launchOptions);
+    return { browser, context: await browser.newContext(contextOptions) };
+  } catch (err) {
+    const locked = /ProcessSingleton|profile.*in use|SingletonLock/i.test(String(err.message));
+    fail(1, `Could not launch Chrome: ${String(err.message).split('\n')[0]}\n` + (locked
+      ? 'The profile is already open in another Chrome window. Close that window and try again.'
+      : 'Install Google Chrome, or set DEMO_BROWSER_PATH to a Chrome/Chromium binary.'));
+  }
+}
+
+/**
+ * --signin: open the plan's persistent profile with exactly the options a recording uses
+ * (cookies saved by an ordinary Chrome window are not readable by the recorder's Chrome),
+ * so the person can sign in by hand. Returns when the window is closed.
+ */
+async function signin(plan, planDir) {
+  if (!plan.profile) fail(1, '--signin needs a "profile" in the plan; sign-ins are kept in that profile.');
+  const options = browserOptions(plan, planDir);
+  const { context } = await openContext(options);
+  const urls = plan.signinUrls ?? (plan.baseUrl ? [plan.baseUrl] : []);
+  const pages = [];
+  for (const [k, url] of urls.entries()) {
+    const p = k === 0 ? context.pages()[0] ?? (await context.newPage()) : await context.newPage();
+    pages.push(p);
+    await p.goto(url).catch((err) => console.error(`${url}: ${String(err.message).split('\n')[0]}`));
+  }
+  await pages[0]?.bringToFront();
+  console.error(`Sign in using the Chrome window (profile "${plan.profile}"), then close it.` +
+    (options.contextOptions.httpCredentials ? '' : '\nSites behind an HTTP basic-auth prompt: set DEMO_HTTP_USER and DEMO_HTTP_PASSWORD, or put the login in the address bar as https://user:password@host/.'));
+  await new Promise((resolve) => context.on('close', resolve));
+  console.log(JSON.stringify({ ok: true, profile: plan.profile, profileDir: options.profileDir }));
+}
+
 async function main() {
-  const { flags, positional } = parseArgs(process.argv.slice(2), ['selftest', 'check', 'no-cut', 'keep-open', 'help']);
+  const { flags, positional } = parseArgs(process.argv.slice(2), ['selftest', 'check', 'no-cut', 'keep-open', 'signin', 'help']);
   if (flags.help || (!flags.selftest && !positional.length)) {
     console.log(USAGE);
     process.exit(flags.help ? 0 : 1);
@@ -118,6 +214,7 @@ async function main() {
   const problems = validatePlan(plan);
   if (problems.length) fail(1, `The plan has ${problems.length} problem(s):\n- ${problems.join('\n- ')}`);
   if (flags.check) { console.log(JSON.stringify({ ok: true, steps: plan.steps.length })); return; }
+  if (flags.signin) { await signin(plan, planDir); return; }
 
   const name = slug(plan.name);
   const outDir = path.resolve(flags.out ?? path.join(process.cwd(), 'demo-videos', name));
@@ -129,42 +226,8 @@ async function main() {
   const warnings = [];
 
   // ---- Launch Chrome -------------------------------------------------------
-  const want = { width: 1440, height: 900, ...(plan.window ?? {}) };
-  const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
-  const launchOptions = {
-    headless: false,
-    chromiumSandbox: !isRoot,
-    ignoreDefaultArgs: ['--enable-automation'],
-    args: [
-      '--window-position=0,0',
-      `--window-size=${want.width},${want.height}`,
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--hide-crash-restore-bubble',
-      '--disable-features=Translate,InfiniteSessionRestore',
-      ...(isRoot ? ['--test-type'] : []),
-    ],
-  };
-  if (process.env.DEMO_BROWSER_PATH) launchOptions.executablePath = process.env.DEMO_BROWSER_PATH;
-  else launchOptions.channel = plan.browser ?? 'chrome';
-  const contextOptions = { viewport: null, ...(plan.baseUrl ? { baseURL: plan.baseUrl } : {}) };
-  if (plan.storageState) contextOptions.storageState = path.resolve(planDir, plan.storageState);
-
-  let browser = null;
-  let context;
-  try {
-    if (plan.profile) {
-      const profileDir = path.join(os.homedir(), '.demo-recorder', 'profiles', slug(plan.profile));
-      await fs.mkdir(profileDir, { recursive: true });
-      context = await chromium.launchPersistentContext(profileDir, { ...launchOptions, ...contextOptions });
-    } else {
-      browser = await chromium.launch(launchOptions);
-      context = await browser.newContext(contextOptions);
-    }
-  } catch (err) {
-    fail(1, `Could not launch Chrome: ${String(err.message).split('\n')[0]}\n` +
-      'Install Google Chrome, or set DEMO_BROWSER_PATH to a Chrome/Chromium binary.');
-  }
+  const { want, ...options } = browserOptions(plan, planDir);
+  const { browser, context } = await openContext(options);
   await context.addInitScript(overlayScript);
   context.setDefaultTimeout((plan.timeout ?? 15) * 1000);
 
@@ -283,6 +346,7 @@ async function main() {
   // ---- Run the plan ---------------------------------------------------------
   const captions = plan.captions !== false;
   const pace = (plan.pace ?? 0.3) * 1000;
+  const wpm = Number(plan.readingSpeed ?? 180);
   const records = [];
   let failure = null;
   let previousStepStart = Date.now();
@@ -308,7 +372,7 @@ async function main() {
     await sleep(120);
   }
 
-  async function runStep(step) {
+  async function runStep(step, rec) {
     const loc = step.target ? page.locator(step.target).first() : null;
     const timeout = step.timeout != null ? step.timeout * 1000 : undefined;
     switch (step.do) {
@@ -387,7 +451,9 @@ async function main() {
         await loc.waitFor({ state: 'visible', timeout });
         await loc.scrollIntoViewIfNeeded();
         await overlay('highlight', await loc.boundingBox());
-        await sleep((step.seconds ?? 1.5) * 1000);
+        // Long enough to read what is ringed, unless the plan says otherwise.
+        const text = step.seconds == null ? await loc.innerText().catch(() => '') : '';
+        await sleep((step.seconds ?? readingSeconds(text, wpm, { base: 1.2, min: 2, max: 7 })) * 1000);
         await overlay('highlight', null);
         break;
       }
@@ -414,6 +480,22 @@ async function main() {
         await reapply(page);
         break;
       }
+      case 'title': {
+        // Drawn in the page and captured as a still; the cutter shows the still full-frame for the
+        // reading time, so the card costs no recording time and shows no browser chrome.
+        const spec = { title: step.title, subtitle: step.subtitle, points: step.points, eyebrow: step.eyebrow };
+        const words = [step.eyebrow, step.title, step.subtitle, ...(step.points ?? [])].join(' ');
+        await overlay('caption', null);
+        await overlay('card', spec);
+        await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+        const image = `title-${String(rec.i + 1).padStart(2, '0')}.png`;
+        await page.screenshot({ path: path.join(outDir, image) });
+        await overlay('card', null);
+        await overlay('caption', caption);
+        rec.image = image;
+        rec.seconds = round3(step.seconds ?? readingSeconds(words, wpm, { base: 2, min: 3, max: 12 }));
+        break;
+      }
       default:
         throw new Error(`Unknown action ${step.do}`);
     }
@@ -421,12 +503,14 @@ async function main() {
 
   for (let i = 0; i < plan.steps.length; i++) {
     const step = plan.steps[i];
-    const rec = { i, do: step.do, label: step.moment ?? null, edit: step.edit ?? 'auto', wallStart: Date.now(), ok: true };
-    if (step.moment && captions) { caption = step.moment; await overlay('caption', caption); }
+    const rec = { i, do: step.do, label: step.moment ?? (step.do === 'title' ? step.title : null), edit: step.edit ?? 'auto', wallStart: Date.now(), ok: true };
+    if (step.moment && captions && step.do !== 'title') { caption = step.moment; await overlay('caption', caption); }
     try {
-      await runStep(step);
+      await runStep(step, rec);
       rec.wallSettled = step.do === 'wait' ? rec.wallStart : Date.now();
-      const hold = step.hold ?? (step.moment ? plan.momentHold ?? 1.5 : 0);
+      // A labeled moment lingers long enough to read its caption; unlabeled steps move on.
+      const hold = step.do === 'title' ? 0
+        : step.hold ?? (step.moment ? Math.max(plan.momentHold ?? 2, readingSeconds(step.moment, wpm, { base: 0.8 })) : 0);
       await sleep(hold * 1000 + pace);
     } catch (err) {
       rec.ok = false;
@@ -500,6 +584,7 @@ async function main() {
       i: r.i, do: r.do, label: r.label, edit: r.edit,
       start: toVideo(r.wallStart), ...(r.wallSettled ? { settled: toVideo(r.wallSettled) } : {}), end: toVideo(r.wallEnd),
       ok: r.ok, ...(r.error ? { error: r.error } : {}),
+      ...(r.image ? { image: r.image, seconds: r.seconds } : {}),
     })),
     failure,
     warnings,

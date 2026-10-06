@@ -111,7 +111,7 @@ export function planEdit(doc, opts = {}) {
   let trimmed = 0;
   const push = (start, end, speed, label) => {
     const prev = segments[segments.length - 1];
-    if (prev && prev.speed === 1 && speed === 1 && Math.abs(prev.end - start) < 0.02) {
+    if (prev && !prev.image && prev.speed === 1 && speed === 1 && Math.abs(prev.end - start) < 0.02) {
       prev.end = round3(end);
       if (!prev.label && label) prev.label = label;
     } else {
@@ -120,7 +120,15 @@ export function planEdit(doc, opts = {}) {
   };
 
   for (const { m, from, to, mode } of steps) {
-    if (mode === 'cut' || to - from < 0.04) continue;
+    if (mode === 'cut') continue;
+    // Title cards: a still image held for its reading time replaces the footage of drawing it.
+    if (m.do === 'title' && m.image) {
+      trimmed += to - from;
+      chapters.push({ segment: segments.length, label: m.label });
+      segments.push({ image: m.image, duration: Number(m.seconds ?? 4), label: m.label ?? '' });
+      continue;
+    }
+    if (to - from < 0.04) continue;
     const pieces = mode === 'keep' ? [[from, to]] : subtract([[from, to]], dead);
     if (!pieces.length) continue;
     const remaining = pieces.reduce((sum, [a, b]) => sum + (b - a), 0);
@@ -184,63 +192,87 @@ const metaEscape = (s) => String(s).replace(/([=;#\\\n])/g, '\\$1');
 export async function render(edl, outFile, baseDir = process.cwd()) {
   const src = path.resolve(baseDir, edl.source);
   const info = await probe(src);
-  const out = { maxWidth: 1920, fps: 30, crf: 20, ...(edl.output ?? {}) };
+  const out = { maxWidth: 1920, fps: 30, crf: 20, cardColor: '0x0f172a', ...(edl.output ?? {}) };
 
   const segments = (edl.segments ?? [])
-    .map((s) => ({
-      ...s,
-      start: clamp(parseTime(s.start), 0, info.duration),
-      end: clamp(parseTime(s.end), 0, info.duration),
-      speed: Number(s.speed ?? 1),
-    }))
-    .filter((s) => s.end - s.start >= 0.04);
-  if (!segments.length) throw new Error('The edit list keeps nothing: no segment has a positive length.');
+    .map((s) => s.image
+      ? { ...s, image: path.resolve(baseDir, s.image), duration: Number(s.duration ?? 4) }
+      : {
+          ...s,
+          start: clamp(parseTime(s.start), 0, info.duration),
+          end: clamp(parseTime(s.end), 0, info.duration),
+          speed: Number(s.speed ?? 1),
+        })
+    .filter((s) => (s.image ? s.duration > 0 : s.end - s.start >= 0.04));
+  if (!segments.some((s) => !s.image)) throw new Error('The edit list keeps nothing: no segment has a positive length.');
   for (const s of segments) {
-    if (!(s.speed > 0)) throw new Error(`Segment ${fmtTime(s.start)}-${fmtTime(s.end)} has an invalid speed.`);
+    if (!s.image && !(s.speed > 0)) throw new Error(`Segment ${fmtTime(s.start)}-${fmtTime(s.end)} has an invalid speed.`);
   }
 
-  const geometry = [];
+  // One output size for every segment, so recorded footage and still images can be joined.
+  let crop = null;
   if (edl.crop) {
     const x = clamp(Math.round(edl.crop.x), 0, info.width - 2);
     const y = clamp(Math.round(edl.crop.y), 0, info.height - 2);
-    const w = even(Math.min(edl.crop.w, info.width - x));
-    const h = even(Math.min(edl.crop.h, info.height - y));
-    geometry.push(`crop=${w}:${h}:${x}:${y}`);
+    crop = { x, y, w: even(Math.min(edl.crop.w, info.width - x)), h: even(Math.min(edl.crop.h, info.height - y)) };
   }
-  geometry.push(`scale='min(${out.maxWidth},iw)':-2:flags=lanczos`);
+  const baseW = crop ? crop.w : info.width;
+  const baseH = crop ? crop.h : info.height;
+  const W = even(Math.min(out.maxWidth, baseW));
+  const H = even(Math.round((baseH * W) / baseW));
+  const geometry = [...(crop ? [`crop=${crop.w}:${crop.h}:${crop.x}:${crop.y}`] : []), `scale=${W}:${H}:flags=lanczos`];
+  const fit = [`scale=${W}:${H}:force_original_aspect_ratio=decrease:flags=lanczos`, `pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:color=${out.cardColor}`];
 
   const args = ['-hide_banner', '-loglevel', 'error', '-y'];
   const filters = [];
   const pads = [];
+  let input = 0;
   let outTime = 0;
   const outStarts = [];
   segments.forEach((s, k) => {
+    if (s.image) {
+      args.push('-loop', '1', '-framerate', String(out.fps), '-t', s.duration.toFixed(3), '-i', s.image);
+      filters.push(`[${input}:v]${fit.join(',')},fps=${out.fps},format=yuv420p,setsar=1[v${k}]`);
+      input++;
+      pads.push(`[v${k}]`);
+      if (info.hasAudio) {
+        args.push('-f', 'lavfi', '-t', s.duration.toFixed(3), '-i', 'anullsrc=r=48000:cl=stereo');
+        filters.push(`[${input}:a]aresample=async=1[a${k}]`);
+        input++;
+        pads.push(`[a${k}]`);
+      }
+      outStarts.push(outTime);
+      outTime += s.duration;
+      return;
+    }
     args.push('-ss', s.start.toFixed(3), '-t', (s.end - s.start).toFixed(3), '-i', src);
     filters.push(
-      `[${k}:v]setpts=(PTS-STARTPTS)/${s.speed},${geometry.join(',')},fps=${out.fps},format=yuv420p,setsar=1[v${k}]`,
+      `[${input}:v]setpts=(PTS-STARTPTS)/${s.speed},${geometry.join(',')},fps=${out.fps},format=yuv420p,setsar=1[v${k}]`,
     );
     pads.push(`[v${k}]`);
     if (info.hasAudio) {
-      filters.push(`[${k}:a]${['asetpts=PTS-STARTPTS', ...atempoChain(s.speed), 'aresample=async=1'].join(',')}[a${k}]`);
+      filters.push(`[${input}:a]${['asetpts=PTS-STARTPTS', ...atempoChain(s.speed), 'aresample=async=1'].join(',')}[a${k}]`);
       pads.push(`[a${k}]`);
     }
+    input++;
     outStarts.push(outTime);
     outTime += (s.end - s.start) / s.speed;
   });
   filters.push(`${pads.join('')}concat=n=${segments.length}:v=1:a=${info.hasAudio ? 1 : 0}[v]${info.hasAudio ? '[a]' : ''}`);
 
-  // Chapters: explicit ones (source times) or segment labels.
+  // Chapters: explicit ones (source times, or a segment index for stills) or segment labels.
   const toOut = (t) => {
     for (let k = 0; k < segments.length; k++) {
       const s = segments[k];
+      if (s.image) continue;
       if (t >= s.start - 0.001 && t <= s.end + 0.001) return outStarts[k] + (t - s.start) / s.speed;
     }
     return null;
   };
   const marks = (edl.chapters?.length
-    ? edl.chapters.map((c) => ({ at: toOut(parseTime(c.at)), label: c.label }))
+    ? edl.chapters.map((c) => ({ at: c.segment != null ? outStarts[c.segment] ?? null : toOut(parseTime(c.at)), label: c.label }))
     : segments.map((s, k) => ({ at: outStarts[k], label: s.label })).filter((c) => c.label && !c.label.startsWith('('))
-  ).filter((c) => c.at != null && c.label);
+  ).filter((c) => c.at != null && c.label).sort((a, b) => a.at - b.at);
 
   await fs.mkdir(path.dirname(outFile), { recursive: true });
   let metaFile = null;
@@ -257,7 +289,7 @@ export async function render(edl, outFile, baseDir = process.cwd()) {
 
   args.push('-filter_complex', filters.join(';'), '-map', '[v]');
   if (info.hasAudio) args.push('-map', '[a]', '-c:a', 'aac', '-b:a', '160k');
-  if (metaFile) args.push('-map_chapters', String(segments.length));
+  if (metaFile) args.push('-map_chapters', String(input));
   if (await hasEncoder('libx264')) args.push('-c:v', 'libx264', '-preset', 'medium', '-crf', String(out.crf));
   else args.push('-c:v', 'h264_videotoolbox', '-b:v', '6M');
   args.push('-pix_fmt', 'yuv420p', '-movflags', '+faststart', outFile);
@@ -271,7 +303,9 @@ export async function render(edl, outFile, baseDir = process.cwd()) {
 
 /** LosslessCut "CSV" import format: start,end,label in seconds, one segment per line. */
 export async function writeLosslessCutCsv(edl, file) {
-  const rows = edl.segments.map((s) => `${Number(s.start).toFixed(3)},${Number(s.end).toFixed(3)},${String(s.label ?? '').replace(/[",\n]/g, ' ')}`);
+  // Still-image segments (title cards) have no place in the source video, so LosslessCut gets the footage only.
+  const rows = edl.segments.filter((s) => !s.image)
+    .map((s) => `${Number(s.start).toFixed(3)},${Number(s.end).toFixed(3)},${String(s.label ?? '').replace(/[",\n]/g, ' ')}`);
   await fs.writeFile(file, rows.join('\n') + '\n');
 }
 
