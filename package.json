@@ -4,6 +4,7 @@
   "description": "Replay a JSON browse plan in real Chrome, screen-record it, and cut the recording down to its moments.",
   "type": "module",
   "private": true,
+  "license": "MIT",
   "bin": {
     "demo-record": "./record.mjs",
     "demo-cut": "./cut.mjs"
