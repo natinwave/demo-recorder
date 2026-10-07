@@ -18,6 +18,19 @@ Settings > Privacy & Security > Screen & System Audio Recording, restart that
 app, and run the self-test again. The self-test passes when it prints
 `"ok": true`; open `demo-videos/selftest/selftest.mp4` to see the result.
 
+## Use it from Claude Code (optional)
+
+`skill/record-feature-demo/SKILL.md` is a skill that teaches Claude Code to write
+plans, record and cut demos with this tool. To install it for yourself:
+
+    mkdir -p ~/.claude/skills/record-feature-demo
+    cp skill/record-feature-demo/SKILL.md ~/.claude/skills/record-feature-demo/
+
+The skill looks for the tool in `$DEMO_RECORDER_HOME`, then `~/demo-recorder`.
+If you cloned it somewhere else, either link it there
+(`ln -s "$PWD" ~/demo-recorder`) or export `DEMO_RECORDER_HOME` in your shell
+profile.
+
 ## Record a feature demo
 
     node ~/demo-recorder/record.mjs demo-videos/coupon.plan.json
